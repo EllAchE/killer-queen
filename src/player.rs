@@ -160,6 +160,13 @@ pub struct QueenDeaths {
 pub enum PlayerController {
     Gamepad(Gamepad),
     Midi { octave: u8 },
+    Keyboard(KeyboardSlot),
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum KeyboardSlot {
+    Left,
+    Right,
 }
 
 #[derive(Component)]
@@ -741,6 +748,26 @@ fn spawn_players(
                     input_map.insert(Action::Dive, GamepadButtonType::DPadDown);
                 }
                 input_map.set_gamepad(gamepad);
+            }
+            if let PlayerController::Keyboard(slot) = ev.player_controller {
+                match slot {
+                    KeyboardSlot::Left => {
+                        input_map.insert(Action::Jump, KeyCode::KeyW);
+                        input_map.insert(Action::Move, VirtualAxis::ad());
+                        input_map.insert(Action::Disconnect, KeyCode::Tab);
+                        if ev.is_queen {
+                            input_map.insert(Action::Dive, KeyCode::KeyS);
+                        }
+                    }
+                    KeyboardSlot::Right => {
+                        input_map.insert(Action::Jump, KeyCode::ArrowUp);
+                        input_map.insert(Action::Move, VirtualAxis::horizontal_arrow_keys());
+                        input_map.insert(Action::Disconnect, KeyCode::Enter);
+                        if ev.is_queen {
+                            input_map.insert(Action::Dive, KeyCode::ArrowDown);
+                        }
+                    }
+                }
             }
 
             let (player_width, player_height) = if ev.is_queen {

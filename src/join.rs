@@ -6,7 +6,7 @@ use crate::{
     berries::{Berry, BerryBundle},
     gates::{GateBundle, GATE_HEIGHT, GATE_NEUTRAL_IDX},
     platforms::{PlatformBundle, PLATFORM_HEIGHT},
-    player::{Action, Player, PlayerController, Queen, SpawnPlayerEvent, Team},
+    player::{Action, KeyboardSlot, Player, PlayerController, Queen, SpawnPlayerEvent, Team},
     ship::RidingOnShip,
     GameState, WINDOW_BOTTOM_Y, WINDOW_HEIGHT, WINDOW_RIGHT_X, WINDOW_WIDTH,
 };
@@ -17,14 +17,19 @@ pub struct JoinPlugin;
 #[derive(Resource, Default)]
 pub struct JoinedGamepads(pub HashSet<Gamepad>);
 
+#[derive(Resource, Default)]
+pub struct JoinedKeyboardSlots(pub HashSet<KeyboardSlot>);
+
 impl Plugin for JoinPlugin {
     fn build(&self, app: &mut App) {
         app.init_resource::<JoinedGamepads>()
+            .init_resource::<JoinedKeyboardSlots>()
             .add_systems(
                 Update,
                 (
                     (check_for_start_game, disconnect).run_if(in_state(GameState::Join)),
                     join,
+                    keyboard_join,
                 ),
             )
             .add_systems(OnEnter(GameState::Join), setup_join)
@@ -154,6 +159,42 @@ fn join(
     }
 }
 
+fn keyboard_join(
+    mut joined_keyboard_slots: ResMut<JoinedKeyboardSlots>,
+    key_inputs: Res<ButtonInput<KeyCode>>,
+    queens: Query<&Team, With<Queen>>,
+    mut ev_spawn_players: EventWriter<SpawnPlayerEvent>,
+) {
+    for (slot, yellow_key, purple_key) in [
+        (KeyboardSlot::Left, KeyCode::KeyQ, KeyCode::KeyE),
+        (KeyboardSlot::Right, KeyCode::BracketLeft, KeyCode::BracketRight),
+    ] {
+        // Join the game when either of a slot's two team keys is pressed
+        if key_inputs.any_just_pressed([yellow_key, purple_key]) {
+            let team = if key_inputs.just_pressed(yellow_key) {
+                Team::Yellow
+            } else {
+                Team::Purple
+            };
+            let is_queen = !queens.iter().any(|&queen_team| queen_team == team);
+
+            // Make sure a keyboard slot cannot join twice
+            if !joined_keyboard_slots.0.contains(&slot) {
+                ev_spawn_players.send(SpawnPlayerEvent {
+                    team,
+                    is_queen,
+                    player_controller: PlayerController::Keyboard(slot),
+                    delay: 0.0,
+                    start_invincible: false,
+                });
+                // Insert the created player's keyboard slot to the hashset of joined slots
+                // Since uniqueness was already checked above, we can insert here unchecked
+                joined_keyboard_slots.0.insert(slot);
+            }
+        }
+    }
+}
+
 fn disconnect(
     mut commands: Commands,
     action_query: Query<(
@@ -167,6 +208,7 @@ fn disconnect(
         Has<Queen>,
     )>,
     mut joined_gamepads: ResMut<JoinedGamepads>,
+    mut joined_keyboard_slots: ResMut<JoinedKeyboardSlots>,
     asset_server: Res<AssetServer>,
     mut join_gates: Query<(Entity, &Team, &mut TextureAtlas), With<JoinGate>>,
 ) {
@@ -184,6 +226,9 @@ fn disconnect(
         if action_state.pressed(&Action::Disconnect) {
             if let PlayerController::Gamepad(gamepad) = player.player_controller {
                 joined_gamepads.0.remove(&gamepad);
+            }
+            if let PlayerController::Keyboard(slot) = player.player_controller {
+                joined_keyboard_slots.0.remove(&slot);
             }
             remove_player(
                 &mut commands,

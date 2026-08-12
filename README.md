@@ -26,6 +26,17 @@ This is a clone of the killer queen arcade game. Play either by
     1. One player lands on top of the other - the player on bottom dies.
     2. The players hit each others sides - if one player is facing the others back, then the player with the back turned dies.
 
+## Computer Keyboard Controls
+
+No gamepad or MIDI keyboard on hand? Up to 2 players can play locally by sharing a single computer keyboard, split into two key zones:
+
+| | Join Yellow | Join Purple | Move | Jump / Fly | Dive (queen only) | Disconnect |
+|---|---|---|---|---|---|---|
+| **Left side** | Q | E | A / D | W | S | Tab |
+| **Right side** | `[` | `]` | ← / → | ↑ | ↓ | Enter |
+
+Press a join key to join that side (first player on each side becomes the queen), exactly like the gamepad L/R join. Keyboard, gamepad, and MIDI players can all join and play in the same match at once.
+
 ## MIDI Keyboard as Controller
 
 You can also use a MIDI keyboard to serve as a controller for several players. On any octave, you can use C# or D# to join a team, C and D to move, and E to jump. You might have to tinker with `midi.rs` to correctly connect to the midi device. A keyboard turned turned out to be the perfect controller for this game, feeling like you are at the arcade playing on the actual cabinet.
