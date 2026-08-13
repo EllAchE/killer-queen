@@ -6,6 +6,7 @@ mod gates;
 mod join;
 #[cfg(feature = "bevy_midi")]
 mod midi;
+mod net;
 mod platforms;
 mod player;
 mod settings;
@@ -17,11 +18,13 @@ use bevy::{prelude::*, render::camera::ScalingMode, window::WindowResolution};
 use bevy_inspector_egui::bevy_egui::EguiPlugin;
 // use bevy_inspector_egui::quick::WorldInspectorPlugin;
 use bevy_rapier2d::prelude::*;
+use bevy_replicon::prelude::RepliconPlugins;
 use gates::GatePlugin;
 use iyes_perf_ui::{diagnostics::PerfUiEntryFPS, PerfUiPlugin, PerfUiRoot};
 use join::JoinPlugin;
 #[cfg(feature = "bevy_midi")]
 use midi::MidiPlugin;
+use net::NetPlugin;
 use platforms::PlatformsPlugin;
 use player::{PlayerPlugin, Team};
 use settings::SettingsPlugin;
@@ -57,6 +60,8 @@ fn main() {
         .add_plugins((
             RapierPhysicsPlugin::<NoUserData>::pixels_per_meter(100.0),
             // RapierDebugRenderPlugin::default(),
+            RepliconPlugins,
+            NetPlugin,
             PlatformsPlugin,
             PlayerPlugin,
             AnimationPlugin,
@@ -80,8 +85,9 @@ fn main() {
 }
 
 #[derive(States, Default, Debug, Clone, PartialEq, Eq, Hash)]
-enum GameState {
+pub enum GameState {
     #[default]
+    NetSetup,
     Join,
     Play,
     GameOver,
