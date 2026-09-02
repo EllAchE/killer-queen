@@ -20,7 +20,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::GameState;
 
-// Fixed default port for the "typed IP:port" connection flow (no LAN auto-discovery in v1).
+// WHY: v1 favors a typed LAN address over discovery so transport work stays scoped.
 pub const DEFAULT_PORT: u16 = 5223;
 // Bump whenever the replicated schema below changes, to avoid stale-client confusion.
 const PROTOCOL_ID: u64 = 1;
@@ -38,26 +38,24 @@ impl Plugin for NetPlugin {
             .replicate::<NetPlayer>()
             .replicate::<NetTeam>()
             .add_client_event::<PlayerInput>(ChannelKind::Unreliable)
+            .add_systems(Update, net_setup_ui.run_if(in_state(GameState::NetSetup)))
             .add_systems(
                 Update,
-                net_setup_ui.run_if(in_state(GameState::NetSetup)),
+                enter_join_on_client_connect.run_if(client_just_connected),
             )
-            .add_systems(Update, enter_join_on_client_connect.run_if(client_just_connected))
             .add_systems(
                 Update,
                 (
                     handle_client_connect.run_if(has_authority),
                     apply_input.run_if(has_authority),
-                    send_local_input,
+                    send_local_input.run_if(in_state(GameState::Join)),
                     render_net_players,
                 ),
             );
     }
 }
 
-/// Marks a minimal networked "walking skeleton" player entity — a placeholder
-/// colored rectangle, not the real queen/worker sprite. See the networked
-/// multiplayer goal's progress log for why this is scoped down.
+/// Keeps transport verification independent of the existing physics-heavy player bundle.
 #[derive(Component, Serialize, Deserialize, Clone, Copy)]
 pub struct NetPlayer;
 
@@ -76,8 +74,7 @@ impl NetTeam {
     }
 }
 
-/// Maps a server-side entity to the client that controls it.
-/// `ClientId::SERVER` marks the host's own locally-controlled entity.
+/// Associates authoritative input with the player it is allowed to move.
 #[derive(Component)]
 struct Owner(ClientId);
 
@@ -87,8 +84,6 @@ struct PlayerInput {
     jump: bool,
 }
 
-/// Marks a client-side entity that has already had its render bundle attached,
-/// so `render_net_players` only does it once per replicated entity.
 #[derive(Component)]
 struct NetSprite;
 
@@ -138,13 +133,12 @@ fn host(commands: &mut Commands, channels: &RepliconChannels) {
         authentication: ServerAuthentication::Unsecure,
         public_addresses: vec![socket.local_addr().unwrap()],
     };
-    let transport = NetcodeServerTransport::new(server_config, socket)
-        .expect("failed to start host transport");
+    let transport =
+        NetcodeServerTransport::new(server_config, socket).expect("failed to start host transport");
 
     commands.insert_resource(server);
     commands.insert_resource(transport);
 
-    // The host's own player is a normal server-side spawn, not a loopback client.
     commands.spawn((
         NetPlayer,
         NetTeam::Yellow,
@@ -229,14 +223,13 @@ fn send_local_input(keys: Res<ButtonInput<KeyCode>>, mut events: EventWriter<Pla
     if keys.pressed(KeyCode::KeyD) || keys.pressed(KeyCode::ArrowRight) {
         move_x += 1.0;
     }
-    let jump =
-        keys.pressed(KeyCode::Space) || keys.pressed(KeyCode::ArrowUp) || keys.pressed(KeyCode::KeyW);
+    let jump = keys.pressed(KeyCode::Space)
+        || keys.pressed(KeyCode::ArrowUp)
+        || keys.pressed(KeyCode::KeyW);
     events.send(PlayerInput { move_x, jump });
 }
 
-/// Blueprint pattern: replicated entities arrive with only data components
-/// (Transform/NetPlayer/NetTeam). Attach the local, non-replicated render
-/// bundle pieces once, without touching the already-replicated Transform.
+/// INVARIANT: Add only client-local rendering state; the replicated `Transform` stays authoritative.
 fn render_net_players(
     mut commands: Commands,
     new_players: Query<(Entity, &NetTeam), (With<NetPlayer>, Without<NetSprite>)>,
