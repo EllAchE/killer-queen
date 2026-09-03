@@ -3,6 +3,7 @@ use std::{f32::MAX, time::Duration};
 use bevy::prelude::*;
 use bevy_rapier2d::prelude::*;
 use leafwing_input_manager::prelude::*;
+use serde::{Deserialize, Serialize};
 
 use crate::{
     animation::Animation, berries::Berry, join::remove_player, settings::GameSettings,
@@ -10,28 +11,28 @@ use crate::{
     WINDOW_LEFT_X, WINDOW_RIGHT_X, WINDOW_TOP_Y, WINDOW_WIDTH,
 };
 
-const PLAYER_MAX_VELOCITY_X: f32 = 600.0;
-const PLAYER_MIN_VELOCITY_X: f32 = 40.0;
-const PLAYER_MAX_FALL_SPEED: f32 = 400.0;
+pub(crate) const PLAYER_MAX_VELOCITY_X: f32 = 600.0;
+pub(crate) const PLAYER_MIN_VELOCITY_X: f32 = 40.0;
+pub(crate) const PLAYER_MAX_FALL_SPEED: f32 = 400.0;
 const PLAYER_MAX_DIVE_SPEED: f32 = 1200.0;
 const PLAYER_MAX_RISE_SPEED: f32 = 600.0;
 const PLAYER_FLY_IMPULSE: f32 = 73.0;
 pub const PLAYER_JUMP_IMPULSE: f32 = 46.0;
-const PLAYER_MOVEMENT_IMPULSE_GROUND: f32 = 180.0;
-const PLAYER_MOVEMENT_IMPULSE_AIR: f32 = 115.0;
-const PLAYER_FRICTION_GROUND: f32 = 0.5;
+pub(crate) const PLAYER_MOVEMENT_IMPULSE_GROUND: f32 = 180.0;
+pub(crate) const PLAYER_MOVEMENT_IMPULSE_AIR: f32 = 115.0;
+pub(crate) const PLAYER_FRICTION_GROUND: f32 = 0.5;
 const PLAYER_FRICTION_AIR: f32 = 0.3;
-const PLAYER_GRAVITY_SCALE: f32 = 15.0;
+pub(crate) const PLAYER_GRAVITY_SCALE: f32 = 15.0;
 const DIVE_GRAVITY_SCALE: f32 = 45.0;
 pub const PLAYER_COLLIDER_WIDTH_MULTIPLIER: f32 = 0.4;
 const RESPAWN_DELAY: f32 = 2.0;
 const INVINCIBILITY_DURATION: f32 = 2.0;
 
-const SPRITESHEET_COLS: usize = 2;
-const SPRITESHEET_ROWS: usize = 2;
+pub(crate) const SPRITESHEET_COLS: usize = 2;
+pub(crate) const SPRITESHEET_ROWS: usize = 2;
 
-const SPRITE_TILE_WIDTH: f32 = 25.0;
-const SPRITE_TILE_HEIGHT: f32 = 25.0;
+pub(crate) const SPRITE_TILE_WIDTH: f32 = 25.0;
+pub(crate) const SPRITE_TILE_HEIGHT: f32 = 25.0;
 const QUEEN_PADDING_X: f32 = 2.0;
 const QUEEN_PADDING_Y: f32 = 3.0;
 pub const QUEEN_RECT: Rect = Rect {
@@ -46,7 +47,7 @@ pub const QUEEN_RECT: Rect = Rect {
 };
 const WORKER_PADDING_X: f32 = 2.0;
 const WORKER_PADDING_Y: f32 = 5.0;
-const WORKER_RECT: Rect = Rect {
+pub(crate) const WORKER_RECT: Rect = Rect {
     min: Vec2 {
         x: WORKER_PADDING_X,
         y: WORKER_PADDING_Y,
@@ -62,7 +63,7 @@ pub const WORKER_RENDER_HEIGHT: f32 = 40.0;
 pub const QUEEN_RENDER_WIDTH: f32 = 60.0;
 pub const QUEEN_RENDER_HEIGHT: f32 = 60.0;
 
-const SPRITE_IDX_STAND: usize = 0;
+pub(crate) const SPRITE_IDX_STAND: usize = 0;
 const SPRITE_IDX_WALKING: &[usize] = &[1, 0];
 const SPRITE_IDX_FLYING: &[usize] = &[2, 0];
 const SPRITE_IDX_DIVING: &[usize] = &[3];
@@ -126,7 +127,7 @@ pub enum Direction {
     Left,
 }
 
-#[derive(Component, PartialEq, Eq, Clone, Copy, Debug)]
+#[derive(Component, PartialEq, Eq, Clone, Copy, Debug, Serialize, Deserialize)]
 pub enum Team {
     Yellow,
     Purple,
@@ -699,7 +700,7 @@ fn add_delayed_player_spawners(
     }
 }
 
-fn get_spritesheet(team: Team, is_queen: bool) -> String {
+pub(crate) fn get_spritesheet(team: Team, is_queen: bool) -> String {
     match (team, is_queen) {
         (Team::Yellow, true) => String::from("spritesheets/queenYellow.png"),
         (Team::Purple, true) => String::from("spritesheets/queenPurple.png"),

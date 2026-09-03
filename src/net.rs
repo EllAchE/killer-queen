@@ -6,6 +6,7 @@ use std::{
 
 use bevy::{prelude::*, winit::WinitSettings};
 use bevy_inspector_egui::bevy_egui::{egui, EguiContexts};
+use bevy_rapier2d::prelude::*;
 use bevy_replicon::prelude::*;
 use bevy_replicon_renet::{
     renet::{
@@ -19,12 +20,12 @@ use bevy_replicon_renet::{
 };
 use serde::{Deserialize, Serialize};
 
-use crate::GameState;
+use crate::{player, player::Team, GameState};
 
 // WHY: v1 favors a typed LAN address over discovery so transport work stays scoped.
 pub const DEFAULT_PORT: u16 = 5223;
 // Bump whenever the replicated schema below changes, to avoid stale-client confusion.
-const PROTOCOL_ID: u64 = 2;
+const PROTOCOL_ID: u64 = 3;
 
 pub struct NetPlugin;
 
@@ -37,7 +38,7 @@ impl Plugin for NetPlugin {
             })
             .replicate::<Transform>()
             .replicate::<NetPlayer>()
-            .replicate::<NetTeam>()
+            .replicate::<Team>()
             .add_client_event::<PlayerInput>(ChannelKind::Unreliable)
             .add_client_event::<TeamSelection>(ChannelKind::Ordered)
             .add_systems(Update, net_setup_ui.run_if(in_state(GameState::NetSetup)))
@@ -51,7 +52,9 @@ impl Plugin for NetPlugin {
                 Update,
                 (
                     apply_team_selection.run_if(has_authority),
-                    apply_input.run_if(has_authority),
+                    (attach_net_physics, track_net_grounded, apply_net_input)
+                        .chain()
+                        .run_if(has_authority),
                     send_local_input.run_if(in_state(GameState::Join)),
                     render_net_players,
                 ),
@@ -59,35 +62,30 @@ impl Plugin for NetPlugin {
     }
 }
 
-/// Keeps transport verification independent of the existing physics-heavy player bundle.
+/// A networked queen/worker player entity. The host attaches real Rapier
+/// physics via `attach_net_physics`; clients only ever receive the
+/// replicated `Transform` and render it — inserting physics components off
+/// the host would run an independent local simulation that fights the
+/// replicated position. Scoped to Worker-only this round: `PlayerInput` has
+/// no fly/dive fields yet, so Queen wings/dive await a later increment.
 #[derive(Component, Serialize, Deserialize, Clone, Copy)]
 pub struct NetPlayer;
-
-#[derive(Component, Serialize, Deserialize, Clone, Copy, PartialEq, Debug)]
-pub enum NetTeam {
-    Yellow,
-    Purple,
-}
-
-impl NetTeam {
-    fn color(&self) -> Color {
-        match self {
-            NetTeam::Yellow => Color::rgb(1.0, 0.773, 0.0),
-            NetTeam::Purple => Color::rgb(0.435, 0.0, 1.0),
-        }
-    }
-}
 
 /// Associates authoritative input with the player it is allowed to move.
 #[derive(Component)]
 struct Owner(ClientId);
 
+/// Host-local ground state for a net player, refreshed each frame from
+/// `ContactForceEvent`. Not replicated: only the host runs physics.
+#[derive(Component, Default)]
+struct NetGrounded(bool);
+
 #[derive(Resource)]
-struct RequestedTeam(NetTeam);
+struct RequestedTeam(Team);
 
 #[derive(Event, Serialize, Deserialize, Debug, Clone, Copy)]
 struct TeamSelection {
-    team: NetTeam,
+    team: Team,
 }
 
 #[derive(Event, Serialize, Deserialize, Debug, Default, Clone, Copy)]
@@ -96,6 +94,8 @@ struct PlayerInput {
     jump: bool,
 }
 
+/// Marks a replicated entity that has already had its local-only render
+/// components attached, so `render_net_players` only does it once.
 #[derive(Component)]
 struct NetSprite;
 
@@ -104,7 +104,7 @@ fn net_setup_ui(
     mut commands: Commands,
     mut next_state: ResMut<NextState<GameState>>,
     mut join_addr: Local<String>,
-    mut selected_team: Local<Option<NetTeam>>,
+    mut selected_team: Local<Option<Team>>,
     channels: Res<RepliconChannels>,
 ) {
     if join_addr.is_empty() {
@@ -114,8 +114,8 @@ fn net_setup_ui(
         ui.label("Use the same WiFi/LAN. Clients type the host computer's local IP:port.");
         ui.horizontal(|ui| {
             ui.label("Team:");
-            ui.selectable_value(&mut *selected_team, Some(NetTeam::Yellow), "Yellow");
-            ui.selectable_value(&mut *selected_team, Some(NetTeam::Purple), "Purple");
+            ui.selectable_value(&mut *selected_team, Some(Team::Yellow), "Yellow");
+            ui.selectable_value(&mut *selected_team, Some(Team::Purple), "Purple");
         });
 
         let team = *selected_team;
@@ -150,7 +150,7 @@ fn net_setup_ui(
     });
 }
 
-fn host(commands: &mut Commands, channels: &RepliconChannels, team: NetTeam) {
+fn host(commands: &mut Commands, channels: &RepliconChannels, team: Team) {
     let server = RenetServer::new(ConnectionConfig {
         server_channels_config: channels.get_server_configs(),
         client_channels_config: channels.get_client_configs(),
@@ -175,12 +175,7 @@ fn host(commands: &mut Commands, channels: &RepliconChannels, team: NetTeam) {
     spawn_net_player(commands, ClientId::SERVER, team);
 }
 
-fn join(
-    commands: &mut Commands,
-    channels: &RepliconChannels,
-    server_addr: SocketAddr,
-    team: NetTeam,
-) {
+fn join(commands: &mut Commands, channels: &RepliconChannels, server_addr: SocketAddr, team: Team) {
     let client = RenetClient::new(ConnectionConfig {
         server_channels_config: channels.get_server_configs(),
         client_channels_config: channels.get_client_configs(),
@@ -231,10 +226,10 @@ fn apply_team_selection(
     }
 }
 
-fn spawn_net_player(commands: &mut Commands, client_id: ClientId, team: NetTeam) {
+fn spawn_net_player(commands: &mut Commands, client_id: ClientId, team: Team) {
     let x = match team {
-        NetTeam::Yellow => -200.0,
-        NetTeam::Purple => 200.0,
+        Team::Yellow => -200.0,
+        Team::Purple => 200.0,
     };
     commands.spawn((
         NetPlayer,
@@ -245,24 +240,102 @@ fn spawn_net_player(commands: &mut Commands, client_id: ClientId, team: NetTeam)
     ));
 }
 
-fn apply_input(
+/// Blueprint pattern: replicated entities arrive with only data components
+/// (Transform/NetPlayer/Team). Attach the host-only physics bundle once,
+/// keyed on `Without<RigidBody>` so it never re-runs for an entity that
+/// already has it. Gated to `has_authority` at the call site, so this never
+/// executes on a client and a client-side entity never gets local physics.
+fn attach_net_physics(
+    mut commands: Commands,
+    new_players: Query<Entity, (With<NetPlayer>, Without<RigidBody>)>,
+) {
+    for entity in &new_players {
+        commands.entity(entity).insert((
+            RigidBody::Dynamic,
+            GravityScale(player::PLAYER_GRAVITY_SCALE),
+            Collider::cuboid(
+                player::WORKER_RENDER_WIDTH / 2.0 * player::PLAYER_COLLIDER_WIDTH_MULTIPLIER,
+                player::WORKER_RENDER_HEIGHT / 2.0,
+            ),
+            Velocity::default(),
+            ExternalImpulse::default(),
+            LockedAxes::ROTATION_LOCKED,
+            Friction {
+                coefficient: 0.0,
+                combine_rule: CoefficientCombineRule::Min,
+            },
+            ActiveEvents::all(),
+            Ccd::enabled(),
+            NetGrounded::default(),
+        ));
+    }
+}
+
+/// Host-only ground detection for net players, mirroring
+/// `player::check_if_players_on_ground`.
+fn track_net_grounded(
+    mut contact_force_events: EventReader<ContactForceEvent>,
+    mut players: Query<&mut NetGrounded>,
+) {
+    for mut grounded in &mut players {
+        grounded.0 = false;
+    }
+    for event in contact_force_events.read() {
+        if let Ok(mut grounded) = players.get_mut(event.collider1) {
+            if event.max_force_direction.y != 0.0 {
+                grounded.0 = true;
+            }
+        }
+        if let Ok(mut grounded) = players.get_mut(event.collider2) {
+            if event.max_force_direction.y != 0.0 {
+                grounded.0 = true;
+            }
+        }
+    }
+}
+
+/// Host-only authoritative physics step: applies a client's input as a real
+/// impulse against the host's Rapier simulation, matching local play's
+/// ground/air movement, friction, and jump impulses.
+fn apply_net_input(
     mut events: EventReader<FromClient<PlayerInput>>,
-    mut players: Query<(&Owner, &mut Transform), With<NetPlayer>>,
+    mut players: Query<
+        (&Owner, &mut ExternalImpulse, &mut Velocity, &NetGrounded),
+        With<NetPlayer>,
+    >,
     time: Res<Time>,
 ) {
     for FromClient { client_id, event } in events.read() {
-        for (owner, mut transform) in &mut players {
+        for (owner, mut impulse, mut velocity, grounded) in &mut players {
             if owner.0 != *client_id {
                 continue;
             }
-            transform.translation.x += event.move_x * 200.0 * time.delta_seconds();
-            let target_y = if event.jump { 120.0 } else { 0.0 };
-            let step = 300.0 * time.delta_seconds();
-            transform.translation.y = if transform.translation.y < target_y {
-                (transform.translation.y + step).min(target_y)
-            } else {
-                (transform.translation.y - step).max(target_y)
-            };
+
+            if event.move_x != 0.0 {
+                let movement_impulse = if grounded.0 {
+                    player::PLAYER_MOVEMENT_IMPULSE_GROUND
+                } else {
+                    player::PLAYER_MOVEMENT_IMPULSE_AIR
+                };
+                impulse.impulse.x += event.move_x * movement_impulse * time.delta_seconds();
+            } else if velocity.linvel.x.abs() < player::PLAYER_MIN_VELOCITY_X {
+                velocity.linvel.x = 0.0;
+            }
+
+            if grounded.0 {
+                impulse.impulse.x -=
+                    velocity.linvel.x * player::PLAYER_FRICTION_GROUND * time.delta_seconds();
+            }
+
+            if event.jump && grounded.0 {
+                impulse.impulse.y += player::PLAYER_JUMP_IMPULSE;
+            }
+
+            velocity.linvel.x = velocity.linvel.x.clamp(
+                -player::PLAYER_MAX_VELOCITY_X,
+                player::PLAYER_MAX_VELOCITY_X,
+            );
+            velocity.linvel.y = velocity.linvel.y.max(-player::PLAYER_MAX_FALL_SPEED);
         }
     }
 }
@@ -275,25 +348,49 @@ fn send_local_input(keys: Res<ButtonInput<KeyCode>>, mut events: EventWriter<Pla
     if keys.pressed(KeyCode::KeyD) || keys.pressed(KeyCode::ArrowRight) {
         move_x += 1.0;
     }
-    let jump = keys.pressed(KeyCode::Space)
-        || keys.pressed(KeyCode::ArrowUp)
-        || keys.pressed(KeyCode::KeyW);
+    // Edge-triggered: sampling `pressed` here would re-fire the jump impulse
+    // every frame the key is held, since the impulse is applied per received
+    // event rather than tracked as a discrete action state.
+    let jump = keys.just_pressed(KeyCode::Space)
+        || keys.just_pressed(KeyCode::ArrowUp)
+        || keys.just_pressed(KeyCode::KeyW);
     events.send(PlayerInput { move_x, jump });
 }
 
-/// INVARIANT: Add only client-local rendering state; the replicated `Transform` stays authoritative.
+/// Blueprint pattern: replicated entities arrive with only data components
+/// (Transform/NetPlayer/Team). Attach the local, non-replicated render
+/// components once, without touching the already-replicated Transform —
+/// inserting a bundle with its own `transform` field would clobber it.
 fn render_net_players(
+    server: Res<AssetServer>,
+    mut atlas_layouts: ResMut<Assets<TextureAtlasLayout>>,
     mut commands: Commands,
-    new_players: Query<(Entity, &NetTeam), (With<NetPlayer>, Without<NetSprite>)>,
+    new_players: Query<(Entity, &Team), (With<NetPlayer>, Without<NetSprite>)>,
 ) {
     for (entity, team) in &new_players {
+        let texture: Handle<Image> = server.load(player::get_spritesheet(*team, false));
+        let layout = TextureAtlasLayout::from_grid(
+            Vec2::new(player::SPRITE_TILE_WIDTH, player::SPRITE_TILE_HEIGHT),
+            player::SPRITESHEET_COLS,
+            player::SPRITESHEET_ROWS,
+            None,
+            None,
+        );
+        let layout_handle = atlas_layouts.add(layout);
         commands.entity(entity).insert((
+            texture,
+            TextureAtlas {
+                layout: layout_handle,
+                index: player::SPRITE_IDX_STAND,
+            },
             Sprite {
-                color: team.color(),
-                custom_size: Some(Vec2::new(40.0, 40.0)),
+                rect: Some(player::WORKER_RECT),
+                custom_size: Some(Vec2::new(
+                    player::WORKER_RENDER_WIDTH,
+                    player::WORKER_RENDER_HEIGHT,
+                )),
                 ..default()
             },
-            Handle::<Image>::default(),
             GlobalTransform::default(),
             Visibility::default(),
             InheritedVisibility::default(),
@@ -318,26 +415,26 @@ mod tests {
         }
         server.add_systems(Update, apply_team_selection);
         client
-            .insert_resource(RequestedTeam(NetTeam::Purple))
+            .insert_resource(RequestedTeam(Team::Purple))
             .add_systems(Update, send_team_selection.run_if(client_just_connected));
         server.connect_client(&mut client);
 
         server.exchange_with_client(&mut client);
         server.update();
-        send_selection(&mut server, &mut client, NetTeam::Yellow);
+        send_selection(&mut server, &mut client, Team::Yellow);
 
         let players: Vec<_> = server
             .world
-            .query::<(&Owner, &NetTeam)>()
+            .query::<(&Owner, &Team)>()
             .iter(&server.world)
             .map(|(owner, team)| (owner.0, *team))
             .collect();
         assert_eq!(players.len(), 1);
         assert_ne!(players[0].0, ClientId::SERVER);
-        assert_eq!(players[0].1, NetTeam::Purple);
+        assert_eq!(players[0].1, Team::Purple);
     }
 
-    fn send_selection(server: &mut App, client: &mut App, team: NetTeam) {
+    fn send_selection(server: &mut App, client: &mut App, team: Team) {
         client.world.send_event(TeamSelection { team });
         client.update();
         server.exchange_with_client(client);
