@@ -14,16 +14,16 @@ use crate::{
 pub(crate) const PLAYER_MAX_VELOCITY_X: f32 = 600.0;
 pub(crate) const PLAYER_MIN_VELOCITY_X: f32 = 40.0;
 pub(crate) const PLAYER_MAX_FALL_SPEED: f32 = 400.0;
-const PLAYER_MAX_DIVE_SPEED: f32 = 1200.0;
-const PLAYER_MAX_RISE_SPEED: f32 = 600.0;
-const PLAYER_FLY_IMPULSE: f32 = 73.0;
+pub(crate) const PLAYER_MAX_DIVE_SPEED: f32 = 1200.0;
+pub(crate) const PLAYER_MAX_RISE_SPEED: f32 = 600.0;
+pub(crate) const PLAYER_FLY_IMPULSE: f32 = 73.0;
 pub const PLAYER_JUMP_IMPULSE: f32 = 46.0;
 pub(crate) const PLAYER_MOVEMENT_IMPULSE_GROUND: f32 = 180.0;
 pub(crate) const PLAYER_MOVEMENT_IMPULSE_AIR: f32 = 115.0;
 pub(crate) const PLAYER_FRICTION_GROUND: f32 = 0.5;
 const PLAYER_FRICTION_AIR: f32 = 0.3;
 pub(crate) const PLAYER_GRAVITY_SCALE: f32 = 15.0;
-const DIVE_GRAVITY_SCALE: f32 = 45.0;
+pub(crate) const DIVE_GRAVITY_SCALE: f32 = 45.0;
 pub const PLAYER_COLLIDER_WIDTH_MULTIPLIER: f32 = 0.4;
 const RESPAWN_DELAY: f32 = 2.0;
 const INVINCIBILITY_DURATION: f32 = 2.0;
@@ -142,7 +142,7 @@ impl Team {
     }
 }
 
-#[derive(Component)]
+#[derive(Component, Serialize, Deserialize, Clone, Copy)]
 pub struct Queen;
 
 #[derive(Component)]

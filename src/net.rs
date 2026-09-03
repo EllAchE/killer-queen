@@ -39,6 +39,7 @@ impl Plugin for NetPlugin {
             .replicate::<Transform>()
             .replicate::<NetPlayer>()
             .replicate::<Team>()
+            .replicate::<player::Queen>()
             .add_client_event::<PlayerInput>(ChannelKind::Unreliable)
             .add_client_event::<TeamSelection>(ChannelKind::Ordered)
             .add_systems(Update, net_setup_ui.run_if(in_state(GameState::NetSetup)))
@@ -66,8 +67,9 @@ impl Plugin for NetPlugin {
 /// physics via `attach_net_physics`; clients only ever receive the
 /// replicated `Transform` and render it — inserting physics components off
 /// the host would run an independent local simulation that fights the
-/// replicated position. Scoped to Worker-only this round: `PlayerInput` has
-/// no fly/dive fields yet, so Queen wings/dive await a later increment.
+/// replicated position. Queen-ness is carried by the replicated
+/// `player::Queen` marker: the first player to join a team is the queen,
+/// every later joiner on that team is a worker.
 #[derive(Component, Serialize, Deserialize, Clone, Copy)]
 pub struct NetPlayer;
 
@@ -91,7 +93,12 @@ struct TeamSelection {
 #[derive(Event, Serialize, Deserialize, Debug, Default, Clone, Copy)]
 struct PlayerInput {
     move_x: f32,
+    /// Edge-triggered primary action: ground jump for a worker, a wing flap
+    /// for a queen (ignored server-side for a worker either way).
     jump: bool,
+    /// Held state, meaningful only for a queen: dive gravity/speed while
+    /// held, ignored server-side for a worker.
+    dive: bool,
 }
 
 /// Marks a replicated entity that has already had its local-only render
@@ -172,7 +179,9 @@ fn host(commands: &mut Commands, channels: &RepliconChannels, team: Team) {
     commands.insert_resource(server);
     commands.insert_resource(transport);
 
-    spawn_net_player(commands, ClientId::SERVER, team);
+    // Nothing has spawned yet, so the host is always the first (and thus the
+    // queen) for its chosen team.
+    spawn_net_player(commands, ClientId::SERVER, team, true);
 }
 
 fn join(commands: &mut Commands, channels: &RepliconChannels, server_addr: SocketAddr, team: Team) {
@@ -217,27 +226,32 @@ fn apply_team_selection(
     mut commands: Commands,
     mut events: EventReader<FromClient<TeamSelection>>,
     players: Query<&Owner, With<NetPlayer>>,
+    queens: Query<&Team, (With<NetPlayer>, With<player::Queen>)>,
 ) {
     let mut assigned_clients: HashSet<_> = players.iter().map(|owner| owner.0).collect();
     for FromClient { client_id, event } in events.read() {
         if assigned_clients.insert(*client_id) {
-            spawn_net_player(&mut commands, *client_id, event.team);
+            let is_queen = !queens.iter().any(|&queen_team| queen_team == event.team);
+            spawn_net_player(&mut commands, *client_id, event.team, is_queen);
         }
     }
 }
 
-fn spawn_net_player(commands: &mut Commands, client_id: ClientId, team: Team) {
+fn spawn_net_player(commands: &mut Commands, client_id: ClientId, team: Team, is_queen: bool) {
     let x = match team {
         Team::Yellow => -200.0,
         Team::Purple => 200.0,
     };
-    commands.spawn((
+    let mut player = commands.spawn((
         NetPlayer,
         team,
         Transform::from_xyz(x, 0.0, 5.0),
         Owner(client_id),
         Replicated,
     ));
+    if is_queen {
+        player.insert(player::Queen);
+    }
 }
 
 /// Blueprint pattern: replicated entities arrive with only data components
@@ -247,15 +261,20 @@ fn spawn_net_player(commands: &mut Commands, client_id: ClientId, team: Team) {
 /// executes on a client and a client-side entity never gets local physics.
 fn attach_net_physics(
     mut commands: Commands,
-    new_players: Query<Entity, (With<NetPlayer>, Without<RigidBody>)>,
+    new_players: Query<(Entity, Has<player::Queen>), (With<NetPlayer>, Without<RigidBody>)>,
 ) {
-    for entity in &new_players {
+    for (entity, is_queen) in &new_players {
+        let (width, height) = if is_queen {
+            (player::QUEEN_RENDER_WIDTH, player::QUEEN_RENDER_HEIGHT)
+        } else {
+            (player::WORKER_RENDER_WIDTH, player::WORKER_RENDER_HEIGHT)
+        };
         commands.entity(entity).insert((
             RigidBody::Dynamic,
             GravityScale(player::PLAYER_GRAVITY_SCALE),
             Collider::cuboid(
-                player::WORKER_RENDER_WIDTH / 2.0 * player::PLAYER_COLLIDER_WIDTH_MULTIPLIER,
-                player::WORKER_RENDER_HEIGHT / 2.0,
+                width / 2.0 * player::PLAYER_COLLIDER_WIDTH_MULTIPLIER,
+                height / 2.0,
             ),
             Velocity::default(),
             ExternalImpulse::default(),
@@ -296,22 +315,31 @@ fn track_net_grounded(
 
 /// Host-only authoritative physics step: applies a client's input as a real
 /// impulse against the host's Rapier simulation, matching local play's
-/// ground/air movement, friction, and jump impulses.
+/// ground/air movement, friction, and jump/fly/dive impulses. A worker jumps
+/// off the ground; a queen (`Has<Queen>`) flaps to fly and can dive for a
+/// faster, gravity-boosted descent — mirroring `player::fly`/`player::dive`.
 fn apply_net_input(
     mut events: EventReader<FromClient<PlayerInput>>,
     mut players: Query<
-        (&Owner, &mut ExternalImpulse, &mut Velocity, &NetGrounded),
+        (
+            &Owner,
+            &mut ExternalImpulse,
+            &mut Velocity,
+            &mut GravityScale,
+            &NetGrounded,
+            Has<player::Queen>,
+        ),
         With<NetPlayer>,
     >,
     time: Res<Time>,
 ) {
     for FromClient { client_id, event } in events.read() {
-        for (owner, mut impulse, mut velocity, grounded) in &mut players {
+        for (owner, mut impulse, mut velocity, mut gravity, grounded, is_queen) in &mut players {
             if owner.0 != *client_id {
                 continue;
             }
 
-            if event.move_x != 0.0 {
+            if event.move_x != 0.0 && !(event.dive && grounded.0) {
                 let movement_impulse = if grounded.0 {
                     player::PLAYER_MOVEMENT_IMPULSE_GROUND
                 } else {
@@ -327,7 +355,16 @@ fn apply_net_input(
                     velocity.linvel.x * player::PLAYER_FRICTION_GROUND * time.delta_seconds();
             }
 
-            if event.jump && grounded.0 {
+            if is_queen {
+                gravity.0 = if event.dive {
+                    player::DIVE_GRAVITY_SCALE
+                } else {
+                    player::PLAYER_GRAVITY_SCALE
+                };
+                if event.jump && !event.dive {
+                    impulse.impulse.y += player::PLAYER_FLY_IMPULSE;
+                }
+            } else if event.jump && grounded.0 {
                 impulse.impulse.y += player::PLAYER_JUMP_IMPULSE;
             }
 
@@ -335,7 +372,18 @@ fn apply_net_input(
                 -player::PLAYER_MAX_VELOCITY_X,
                 player::PLAYER_MAX_VELOCITY_X,
             );
-            velocity.linvel.y = velocity.linvel.y.max(-player::PLAYER_MAX_FALL_SPEED);
+            velocity.linvel.y = velocity.linvel.y.clamp(
+                if is_queen && event.dive {
+                    -player::PLAYER_MAX_DIVE_SPEED
+                } else {
+                    -player::PLAYER_MAX_FALL_SPEED
+                },
+                if is_queen {
+                    player::PLAYER_MAX_RISE_SPEED
+                } else {
+                    f32::MAX
+                },
+            );
         }
     }
 }
@@ -354,7 +402,10 @@ fn send_local_input(keys: Res<ButtonInput<KeyCode>>, mut events: EventWriter<Pla
     let jump = keys.just_pressed(KeyCode::Space)
         || keys.just_pressed(KeyCode::ArrowUp)
         || keys.just_pressed(KeyCode::KeyW);
-    events.send(PlayerInput { move_x, jump });
+    // Held, not edge-triggered: a queen dives for as long as this is down.
+    // Sent unconditionally; the host ignores it for a worker.
+    let dive = keys.pressed(KeyCode::KeyS) || keys.pressed(KeyCode::ArrowDown);
+    events.send(PlayerInput { move_x, jump, dive });
 }
 
 /// Blueprint pattern: replicated entities arrive with only data components
@@ -365,10 +416,10 @@ fn render_net_players(
     server: Res<AssetServer>,
     mut atlas_layouts: ResMut<Assets<TextureAtlasLayout>>,
     mut commands: Commands,
-    new_players: Query<(Entity, &Team), (With<NetPlayer>, Without<NetSprite>)>,
+    new_players: Query<(Entity, &Team, Has<player::Queen>), (With<NetPlayer>, Without<NetSprite>)>,
 ) {
-    for (entity, team) in &new_players {
-        let texture: Handle<Image> = server.load(player::get_spritesheet(*team, false));
+    for (entity, team, is_queen) in &new_players {
+        let texture: Handle<Image> = server.load(player::get_spritesheet(*team, is_queen));
         let layout = TextureAtlasLayout::from_grid(
             Vec2::new(player::SPRITE_TILE_WIDTH, player::SPRITE_TILE_HEIGHT),
             player::SPRITESHEET_COLS,
@@ -377,6 +428,19 @@ fn render_net_players(
             None,
         );
         let layout_handle = atlas_layouts.add(layout);
+        let (rect, width, height) = if is_queen {
+            (
+                player::QUEEN_RECT,
+                player::QUEEN_RENDER_WIDTH,
+                player::QUEEN_RENDER_HEIGHT,
+            )
+        } else {
+            (
+                player::WORKER_RECT,
+                player::WORKER_RENDER_WIDTH,
+                player::WORKER_RENDER_HEIGHT,
+            )
+        };
         commands.entity(entity).insert((
             texture,
             TextureAtlas {
@@ -384,11 +448,8 @@ fn render_net_players(
                 index: player::SPRITE_IDX_STAND,
             },
             Sprite {
-                rect: Some(player::WORKER_RECT),
-                custom_size: Some(Vec2::new(
-                    player::WORKER_RENDER_WIDTH,
-                    player::WORKER_RENDER_HEIGHT,
-                )),
+                rect: Some(rect),
+                custom_size: Some(Vec2::new(width, height)),
                 ..default()
             },
             GlobalTransform::default(),
