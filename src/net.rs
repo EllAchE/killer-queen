@@ -1,4 +1,5 @@
 use std::{
+    collections::HashSet,
     net::{Ipv4Addr, SocketAddr, UdpSocket},
     time::{SystemTime, UNIX_EPOCH},
 };
@@ -23,7 +24,7 @@ use crate::GameState;
 // WHY: v1 favors a typed LAN address over discovery so transport work stays scoped.
 pub const DEFAULT_PORT: u16 = 5223;
 // Bump whenever the replicated schema below changes, to avoid stale-client confusion.
-const PROTOCOL_ID: u64 = 1;
+const PROTOCOL_ID: u64 = 2;
 
 pub struct NetPlugin;
 
@@ -38,15 +39,18 @@ impl Plugin for NetPlugin {
             .replicate::<NetPlayer>()
             .replicate::<NetTeam>()
             .add_client_event::<PlayerInput>(ChannelKind::Unreliable)
+            .add_client_event::<TeamSelection>(ChannelKind::Ordered)
             .add_systems(Update, net_setup_ui.run_if(in_state(GameState::NetSetup)))
             .add_systems(
                 Update,
-                enter_join_on_client_connect.run_if(client_just_connected),
+                (send_team_selection, enter_join_on_client_connect)
+                    .chain()
+                    .run_if(client_just_connected),
             )
             .add_systems(
                 Update,
                 (
-                    handle_client_connect.run_if(has_authority),
+                    apply_team_selection.run_if(has_authority),
                     apply_input.run_if(has_authority),
                     send_local_input.run_if(in_state(GameState::Join)),
                     render_net_players,
@@ -78,6 +82,14 @@ impl NetTeam {
 #[derive(Component)]
 struct Owner(ClientId);
 
+#[derive(Resource)]
+struct RequestedTeam(NetTeam);
+
+#[derive(Event, Serialize, Deserialize, Debug, Clone, Copy)]
+struct TeamSelection {
+    team: NetTeam,
+}
+
 #[derive(Event, Serialize, Deserialize, Debug, Default, Clone, Copy)]
 struct PlayerInput {
     move_x: f32,
@@ -92,32 +104,53 @@ fn net_setup_ui(
     mut commands: Commands,
     mut next_state: ResMut<NextState<GameState>>,
     mut join_addr: Local<String>,
+    mut selected_team: Local<Option<NetTeam>>,
     channels: Res<RepliconChannels>,
 ) {
     if join_addr.is_empty() {
         *join_addr = format!("127.0.0.1:{DEFAULT_PORT}");
     }
     egui::Window::new("Networked Multiplayer").show(contexts.ctx_mut(), |ui| {
-        ui.label("Host a game, or join one by typing the host's IP:port.");
-        if ui.button("Host").clicked() {
-            host(&mut commands, &channels);
-            next_state.set(GameState::Join);
+        ui.label("Use the same WiFi/LAN. Clients type the host computer's local IP:port.");
+        ui.horizontal(|ui| {
+            ui.label("Team:");
+            ui.selectable_value(&mut *selected_team, Some(NetTeam::Yellow), "Yellow");
+            ui.selectable_value(&mut *selected_team, Some(NetTeam::Purple), "Purple");
+        });
+
+        let team = *selected_team;
+        if ui
+            .add_enabled(team.is_some(), egui::Button::new("Host"))
+            .clicked()
+        {
+            if let Some(team) = team {
+                host(&mut commands, &channels, team);
+                next_state.set(GameState::Join);
+            }
         }
         ui.separator();
         ui.horizontal(|ui| {
             ui.label("Join:");
             ui.text_edit_singleline(&mut *join_addr);
-            if ui.button("Connect").clicked() {
-                match join_addr.parse::<SocketAddr>() {
-                    Ok(addr) => join(&mut commands, &channels, addr),
-                    Err(err) => warn!("could not parse address {}: {err}", *join_addr),
+            if ui
+                .add_enabled(team.is_some(), egui::Button::new("Connect"))
+                .clicked()
+            {
+                if let Some(team) = team {
+                    match join_addr.parse::<SocketAddr>() {
+                        Ok(addr) => join(&mut commands, &channels, addr, team),
+                        Err(err) => warn!("could not parse address {}: {err}", *join_addr),
+                    }
                 }
             }
         });
+        if team.is_none() {
+            ui.label("Choose a team to enable Host and Connect.");
+        }
     });
 }
 
-fn host(commands: &mut Commands, channels: &RepliconChannels) {
+fn host(commands: &mut Commands, channels: &RepliconChannels, team: NetTeam) {
     let server = RenetServer::new(ConnectionConfig {
         server_channels_config: channels.get_server_configs(),
         client_channels_config: channels.get_client_configs(),
@@ -139,16 +172,15 @@ fn host(commands: &mut Commands, channels: &RepliconChannels) {
     commands.insert_resource(server);
     commands.insert_resource(transport);
 
-    commands.spawn((
-        NetPlayer,
-        NetTeam::Yellow,
-        Transform::from_xyz(-200.0, 0.0, 5.0),
-        Owner(ClientId::SERVER),
-        Replicated,
-    ));
+    spawn_net_player(commands, ClientId::SERVER, team);
 }
 
-fn join(commands: &mut Commands, channels: &RepliconChannels, server_addr: SocketAddr) {
+fn join(
+    commands: &mut Commands,
+    channels: &RepliconChannels,
+    server_addr: SocketAddr,
+    team: NetTeam,
+) {
     let client = RenetClient::new(ConnectionConfig {
         server_channels_config: channels.get_server_configs(),
         client_channels_config: channels.get_client_configs(),
@@ -173,24 +205,44 @@ fn join(commands: &mut Commands, channels: &RepliconChannels, server_addr: Socke
 
     commands.insert_resource(client);
     commands.insert_resource(transport);
+    commands.insert_resource(RequestedTeam(team));
+}
+
+fn send_team_selection(requested_team: Res<RequestedTeam>, mut events: EventWriter<TeamSelection>) {
+    events.send(TeamSelection {
+        team: requested_team.0,
+    });
 }
 
 fn enter_join_on_client_connect(mut next_state: ResMut<NextState<GameState>>) {
     next_state.set(GameState::Join);
 }
 
-fn handle_client_connect(mut commands: Commands, mut server_events: EventReader<ServerEvent>) {
-    for event in server_events.read() {
-        if let ServerEvent::ClientConnected { client_id } = event {
-            commands.spawn((
-                NetPlayer,
-                NetTeam::Purple,
-                Transform::from_xyz(200.0, 0.0, 5.0),
-                Owner(*client_id),
-                Replicated,
-            ));
+fn apply_team_selection(
+    mut commands: Commands,
+    mut events: EventReader<FromClient<TeamSelection>>,
+    players: Query<&Owner, With<NetPlayer>>,
+) {
+    let mut assigned_clients: HashSet<_> = players.iter().map(|owner| owner.0).collect();
+    for FromClient { client_id, event } in events.read() {
+        if assigned_clients.insert(*client_id) {
+            spawn_net_player(&mut commands, *client_id, event.team);
         }
     }
+}
+
+fn spawn_net_player(commands: &mut Commands, client_id: ClientId, team: NetTeam) {
+    let x = match team {
+        NetTeam::Yellow => -200.0,
+        NetTeam::Purple => 200.0,
+    };
+    commands.spawn((
+        NetPlayer,
+        team,
+        Transform::from_xyz(x, 0.0, 5.0),
+        Owner(client_id),
+        Replicated,
+    ));
 }
 
 fn apply_input(
@@ -248,5 +300,47 @@ fn render_net_players(
             ViewVisibility::default(),
             NetSprite,
         ));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use bevy_replicon::test_app::ServerTestAppExt;
+
+    #[test]
+    fn server_uses_first_team_selected_by_client() {
+        let mut server = App::new();
+        let mut client = App::new();
+        for app in [&mut server, &mut client] {
+            app.add_plugins((MinimalPlugins, RepliconPlugins))
+                .add_client_event::<TeamSelection>(ChannelKind::Ordered);
+        }
+        server.add_systems(Update, apply_team_selection);
+        client
+            .insert_resource(RequestedTeam(NetTeam::Purple))
+            .add_systems(Update, send_team_selection.run_if(client_just_connected));
+        server.connect_client(&mut client);
+
+        server.exchange_with_client(&mut client);
+        server.update();
+        send_selection(&mut server, &mut client, NetTeam::Yellow);
+
+        let players: Vec<_> = server
+            .world
+            .query::<(&Owner, &NetTeam)>()
+            .iter(&server.world)
+            .map(|(owner, team)| (owner.0, *team))
+            .collect();
+        assert_eq!(players.len(), 1);
+        assert_ne!(players[0].0, ClientId::SERVER);
+        assert_eq!(players[0].1, NetTeam::Purple);
+    }
+
+    fn send_selection(server: &mut App, client: &mut App, team: NetTeam) {
+        client.world.send_event(TeamSelection { team });
+        client.update();
+        server.exchange_with_client(client);
+        server.update();
     }
 }
