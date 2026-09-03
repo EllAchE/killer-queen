@@ -37,6 +37,19 @@ No gamepad or MIDI keyboard on hand? Up to 2 players can play locally by sharing
 
 Press a join key to join that side (first player on each side becomes the queen), exactly like the gamepad L/R join. Keyboard, gamepad, and MIDI players can all join and play in the same match at once.
 
+## LAN/WiFi Multiplayer Prototype
+
+The native build can synchronize placeholder players between computers on the same local network. It does not yet run a complete remote match.
+
+1. On every computer, run `cargo run --features bevy/dynamic_linking --release` from the same commit.
+2. Connect the computers to the same LAN or WiFi. Guest WiFi may isolate devices and prevent connections.
+3. On one computer, choose a team and select **Host**. The host listens for UDP traffic on port `5223`.
+4. Find the host computer's local IPv4 address. On macOS WiFi, `ipconfig getifaddr en0` commonly prints it.
+5. On each other computer, choose a team, replace `127.0.0.1` with the host's address (for example, `192.168.1.42:5223`), and select **Connect**.
+6. Allow incoming network traffic through the host firewall. Disconnect a VPN if it routes local traffic away from the LAN.
+
+Move the network placeholder with A/D or Left/Right, and jump with W, Space, or Up.
+
 ## MIDI Keyboard as Controller
 
 You can also use a MIDI keyboard to serve as a controller for several players. On any octave, you can use C# or D# to join a team, C and D to move, and E to jump. You might have to tinker with `midi.rs` to correctly connect to the midi device. A keyboard turned turned out to be the perfect controller for this game, feeling like you are at the arcade playing on the actual cabinet.
