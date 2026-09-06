@@ -44,6 +44,12 @@ impl Plugin for NetPlugin {
             .add_client_event::<TeamSelection>(ChannelKind::Ordered)
             .add_systems(Update, net_setup_ui.run_if(in_state(GameState::NetSetup)))
             .add_systems(
+                PreUpdate,
+                remove_disconnected_players
+                    .after(ServerSet::Receive)
+                    .run_if(has_authority),
+            )
+            .add_systems(
                 Update,
                 (send_team_selection, enter_join_on_client_connect)
                     .chain()
@@ -233,6 +239,44 @@ fn apply_team_selection(
         if assigned_clients.insert(*client_id) {
             let is_queen = !queens.iter().any(|&queen_team| queen_team == event.team);
             spawn_net_player(&mut commands, *client_id, event.team, is_queen);
+        }
+    }
+}
+
+/// Host-only cleanup for a dropped client, so a disconnect doesn't leave a
+/// ghost player running host physics forever.
+///
+/// WHY `PreUpdate` after `ServerSet::Receive`: that set is where replicon's
+/// `handle_connections` drops the client from `ConnectedClients`, so the
+/// despawn lands before `PostUpdate`'s `ServerSet::Send` and never addresses
+/// the departed client. Despawning from `Update` races that and logs an
+/// invalid-client send warning.
+///
+/// This also reopens the team's queen slot: `apply_team_selection` decides
+/// queen-ness by querying for a live queen on the team, so a dropped queen's
+/// replacement is the next joiner rather than nobody.
+fn remove_disconnected_players(
+    mut commands: Commands,
+    mut events: EventReader<ServerEvent>,
+    players: Query<(Entity, &Owner), With<NetPlayer>>,
+) {
+    // WHY collect first: one scan of the player query however many clients
+    // dropped this frame, and a repeated event can't queue a second despawn
+    // against an already-despawned entity.
+    let dropped: HashSet<_> = events
+        .read()
+        .filter_map(|event| match event {
+            ServerEvent::ClientDisconnected { client_id, .. } => Some(*client_id),
+            ServerEvent::ClientConnected { .. } => None,
+        })
+        .collect();
+    if dropped.is_empty() {
+        return;
+    }
+
+    for (entity, owner) in &players {
+        if dropped.contains(&owner.0) {
+            commands.entity(entity).despawn();
         }
     }
 }
@@ -493,6 +537,72 @@ mod tests {
         assert_eq!(players.len(), 1);
         assert_ne!(players[0].0, ClientId::SERVER);
         assert_eq!(players[0].1, Team::Purple);
+    }
+
+    #[test]
+    fn disconnect_removes_player_and_reopens_queen_slot() {
+        let mut server = App::new();
+        let mut first = App::new();
+        let mut second = App::new();
+        for app in [&mut server, &mut first, &mut second] {
+            app.add_plugins((MinimalPlugins, RepliconPlugins))
+                .add_client_event::<TeamSelection>(ChannelKind::Ordered);
+        }
+        server
+            .add_systems(Update, apply_team_selection)
+            .add_systems(
+                PreUpdate,
+                remove_disconnected_players
+                    .after(ServerSet::Receive)
+                    .run_if(has_authority),
+            );
+        for app in [&mut first, &mut second] {
+            app.insert_resource(RequestedTeam(Team::Yellow))
+                .add_systems(Update, send_team_selection.run_if(client_just_connected));
+        }
+
+        server.connect_client(&mut first);
+        server.exchange_with_client(&mut first);
+        server.update();
+        send_selection(&mut server, &mut first, Team::Yellow);
+        assert_eq!(
+            queen_count(&mut server),
+            1,
+            "first joiner on a team should be its queen"
+        );
+
+        server.disconnect_client(&mut first);
+        assert_eq!(
+            player_count(&mut server),
+            0,
+            "a disconnected client's player should be despawned, not left as a ghost"
+        );
+
+        server.connect_client(&mut second);
+        server.exchange_with_client(&mut second);
+        server.update();
+        send_selection(&mut server, &mut second, Team::Yellow);
+        assert_eq!(
+            queen_count(&mut server),
+            1,
+            "the vacated queen slot should be reopened for the next joiner"
+        );
+    }
+
+    fn player_count(server: &mut App) -> usize {
+        server
+            .world
+            .query_filtered::<Entity, With<NetPlayer>>()
+            .iter(&server.world)
+            .count()
+    }
+
+    fn queen_count(server: &mut App) -> usize {
+        server
+            .world
+            .query_filtered::<Entity, (With<NetPlayer>, With<player::Queen>)>()
+            .iter(&server.world)
+            .count()
     }
 
     fn send_selection(server: &mut App, client: &mut App, team: Team) {
