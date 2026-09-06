@@ -243,33 +243,40 @@ fn apply_team_selection(
     }
 }
 
-/// Host-only cleanup for a client that dropped, so a disconnect doesn't leave
-/// a ghost player running host physics forever.
+/// Host-only cleanup for a dropped client, so a disconnect doesn't leave a
+/// ghost player running host physics forever.
 ///
-/// Scheduled in `PreUpdate` after `ServerSet::Receive` deliberately. That set
-/// is where replicon's own `handle_connections` drops the client from
-/// `ConnectedClients`, so by the time this despawns the entity the client is
-/// already out of the send set and `PostUpdate`'s `ServerSet::Send` never
-/// addresses it. Despawning from `Update` instead raced that bookkeeping and
-/// logged an invalid-client send warning.
+/// WHY `PreUpdate` after `ServerSet::Receive`: that set is where replicon's
+/// `handle_connections` drops the client from `ConnectedClients`, so the
+/// despawn lands before `PostUpdate`'s `ServerSet::Send` and never addresses
+/// the departed client. Despawning from `Update` races that and logs an
+/// invalid-client send warning.
 ///
-/// Removing the entity also reopens the team's queen slot for free:
-/// `apply_team_selection` decides queen-ness by querying for a live queen on
-/// the team, so once a dropped queen is gone the next joiner becomes queen
-/// instead of the team being stuck queenless for the rest of the match.
+/// This also reopens the team's queen slot: `apply_team_selection` decides
+/// queen-ness by querying for a live queen on the team, so a dropped queen's
+/// replacement is the next joiner rather than nobody.
 fn remove_disconnected_players(
     mut commands: Commands,
     mut events: EventReader<ServerEvent>,
     players: Query<(Entity, &Owner), With<NetPlayer>>,
 ) {
-    for event in events.read() {
-        let ServerEvent::ClientDisconnected { client_id, .. } = event else {
-            continue;
-        };
-        for (entity, owner) in &players {
-            if owner.0 == *client_id {
-                commands.entity(entity).despawn();
-            }
+    // WHY collect first: one scan of the player query however many clients
+    // dropped this frame, and a repeated event can't queue a second despawn
+    // against an already-despawned entity.
+    let dropped: HashSet<_> = events
+        .read()
+        .filter_map(|event| match event {
+            ServerEvent::ClientDisconnected { client_id, .. } => Some(*client_id),
+            ServerEvent::ClientConnected { .. } => None,
+        })
+        .collect();
+    if dropped.is_empty() {
+        return;
+    }
+
+    for (entity, owner) in &players {
+        if dropped.contains(&owner.0) {
+            commands.entity(entity).despawn();
         }
     }
 }
@@ -532,9 +539,6 @@ mod tests {
         assert_eq!(players[0].1, Team::Purple);
     }
 
-    /// A dropped client must not leave a ghost player behind, and a dropped
-    /// queen must free its team's queen slot rather than leaving that team
-    /// queenless for the rest of the match.
     #[test]
     fn disconnect_removes_player_and_reopens_queen_slot() {
         let mut server = App::new();
