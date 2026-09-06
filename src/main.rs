@@ -11,6 +11,7 @@ mod platforms;
 mod player;
 mod settings;
 mod ship;
+mod trail;
 
 use animation::AnimationPlugin;
 use berries::BerriesPlugin;
@@ -29,6 +30,7 @@ use platforms::PlatformsPlugin;
 use player::{PlayerPlugin, Team};
 use settings::SettingsPlugin;
 use ship::ShipPlugin;
+use trail::TrailPlugin;
 
 const WINDOW_WIDTH: f32 = 1920.0;
 const WINDOW_HEIGHT: f32 = 1016.0;
@@ -65,6 +67,7 @@ fn main() {
             PlatformsPlugin,
             PlayerPlugin,
             AnimationPlugin,
+            TrailPlugin,
             BerriesPlugin,
             ShipPlugin,
             GatePlugin,

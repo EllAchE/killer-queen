@@ -15,6 +15,18 @@ impl Animation {
             timer: Timer::new(delay, TimerMode::Repeating),
         }
     }
+
+    /// Retimes a running animation in place. Carrying the elapsed time over
+    /// means a speed change shifts the cycle rate instead of snapping the
+    /// sprite back to the start of the cycle every frame the speed changes.
+    pub fn set_cycle_time(&mut self, delay: Duration) {
+        if self.timer.duration() == delay {
+            return;
+        }
+        let elapsed = self.timer.elapsed().min(delay);
+        self.timer.set_duration(delay);
+        self.timer.set_elapsed(elapsed);
+    }
 }
 
 pub struct AnimationPlugin;

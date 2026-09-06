@@ -7,8 +7,8 @@ use serde::{Deserialize, Serialize};
 
 use crate::{
     animation::Animation, berries::Berry, join::remove_player, settings::GameSettings,
-    ship::RidingOnShip, GameState, WinCondition, WinEvent, WINDOW_BOTTOM_Y, WINDOW_HEIGHT,
-    WINDOW_LEFT_X, WINDOW_RIGHT_X, WINDOW_TOP_Y, WINDOW_WIDTH,
+    ship::RidingOnShip, trail::MotionTrail, GameState, WinCondition, WinEvent, WINDOW_BOTTOM_Y,
+    WINDOW_HEIGHT, WINDOW_LEFT_X, WINDOW_RIGHT_X, WINDOW_TOP_Y, WINDOW_WIDTH,
 };
 
 pub(crate) const PLAYER_MAX_VELOCITY_X: f32 = 600.0;
@@ -65,10 +65,21 @@ pub const QUEEN_RENDER_HEIGHT: f32 = 60.0;
 
 pub(crate) const SPRITE_IDX_STAND: usize = 0;
 const SPRITE_IDX_WALKING: &[usize] = &[1, 0];
-const SPRITE_IDX_FLYING: &[usize] = &[2, 0];
 const SPRITE_IDX_DIVING: &[usize] = &[3];
+/// Wings out, mid-beat. Doubles as a worker's rising frame.
+const SPRITE_IDX_WINGS_OUT: usize = 2;
+/// Wings tucked: a queen's glide between beats, and a worker on the way down.
+const SPRITE_IDX_GLIDE: usize = 0;
 
 const CYCLE_DELAY: Duration = Duration::from_millis(70);
+/// One wing beat: wings out for the leading fraction of it, tucked for the
+/// rest. Sized so a beat reads as a distinct flap rather than a strobe when a
+/// queen is mashing to climb.
+const FLAP_DURATION: Duration = Duration::from_millis(260);
+const FLAP_WINGS_OUT_FRACTION: f32 = 0.55;
+/// Run cycle bounds, interpolated over horizontal speed.
+const WALK_CYCLE_SLOWEST_MILLIS: f32 = 130.0;
+const WALK_CYCLE_FASTEST_MILLIS: f32 = 35.0;
 
 pub struct PlayerPlugin;
 
@@ -90,9 +101,8 @@ impl Plugin for PlayerPlugin {
                             (fly, jump, dive).before(limit_fall_speed),
                             limit_fall_speed,
                             update_sprite_direction,
-                            apply_movement_animation,
-                            apply_idle_sprite.after(movement),
-                            apply_fly_sprite,
+                            apply_ground_animation.after(movement),
+                            animate_flight,
                         )
                             .after(check_if_players_on_ground),
                     )
@@ -179,6 +189,34 @@ pub struct Player {
 
 #[derive(Component)]
 pub struct Wings;
+
+/// Drives a winged player's wing beat. It lives for the whole life of the
+/// player and idles finished, so `fly` can restart it in place: inserting the
+/// component on each flap instead would not land until the next command flush,
+/// dropping the first frame of every beat.
+#[derive(Component)]
+pub struct Wingbeat {
+    timer: Timer,
+}
+
+impl Default for Wingbeat {
+    fn default() -> Self {
+        let mut timer = Timer::new(FLAP_DURATION, TimerMode::Once);
+        timer.set_elapsed(FLAP_DURATION);
+        Self { timer }
+    }
+}
+
+impl Wingbeat {
+    fn start(&mut self) {
+        self.timer.reset();
+    }
+
+    /// True only while the wings are out, which is the leading part of a beat.
+    fn wings_are_out(&self) -> bool {
+        !self.timer.finished() && self.timer.fraction() < FLAP_WINGS_OUT_FRACTION
+    }
+}
 
 fn setup(mut commands: Commands, asset_server: Res<AssetServer>) {
     for team in [Team::Yellow, Team::Purple] {
@@ -280,10 +318,11 @@ fn friction(mut query: Query<(&mut ExternalImpulse, &Velocity, &Player)>, time: 
     }
 }
 
-fn fly(mut query: Query<(&ActionState<Action>, &mut ExternalImpulse), With<Wings>>) {
-    for (action_state, mut impulse) in query.iter_mut() {
+fn fly(mut query: Query<(&ActionState<Action>, &mut ExternalImpulse, &mut Wingbeat), With<Wings>>) {
+    for (action_state, mut impulse, mut wingbeat) in query.iter_mut() {
         if action_state.just_pressed(&Action::Jump) && !action_state.pressed(&Action::Dive) {
             impulse.impulse.y += PLAYER_FLY_IMPULSE;
+            wingbeat.start();
         }
     }
 }
@@ -340,52 +379,85 @@ fn is_running(velocity: &Velocity) -> bool {
     !is_close_to_zero(velocity.linvel.x)
 }
 
-fn apply_movement_animation(
-    mut commands: Commands,
-    query: Query<(Entity, &Velocity, &Player, Option<&Animation>)>,
-) {
-    for (player_entity, velocity, player, animation) in query.iter() {
-        if is_running(velocity)
-            && player.is_on_ground
-            && animation.map_or(true, |animation| animation.sprites == SPRITE_IDX_FLYING)
-        {
-            commands
-                .entity(player_entity)
-                .insert(Animation::new(SPRITE_IDX_WALKING, CYCLE_DELAY));
-        }
-    }
+/// The faster you run the faster your feet move, instead of one fixed cycle
+/// rate at every speed.
+fn walk_cycle_time(speed: f32) -> Duration {
+    let fraction_of_top_speed = ((speed - PLAYER_MIN_VELOCITY_X)
+        / (PLAYER_MAX_VELOCITY_X - PLAYER_MIN_VELOCITY_X))
+        .clamp(0.0, 1.0);
+    let millis = WALK_CYCLE_SLOWEST_MILLIS
+        + (WALK_CYCLE_FASTEST_MILLIS - WALK_CYCLE_SLOWEST_MILLIS) * fraction_of_top_speed;
+    Duration::from_secs_f32(millis / 1000.0)
 }
 
-fn apply_idle_sprite(
+fn apply_ground_animation(
     mut commands: Commands,
     mut query: Query<(
         Entity,
-        &Velocity,
-        &mut TextureAtlas,
         &Player,
+        &Velocity,
         &ActionState<Action>,
+        &mut TextureAtlas,
+        Option<&mut Animation>,
     )>,
 ) {
-    for (player_entity, velocity, mut sprite, player, action_state) in query.iter_mut() {
-        if !is_running(velocity) && player.is_on_ground && !action_state.pressed(&Action::Dive) {
+    for (player_entity, player, velocity, action_state, mut sprite, animation) in query.iter_mut() {
+        if !player.is_on_ground || action_state.pressed(&Action::Dive) {
+            continue;
+        }
+        if is_running(velocity) {
+            let cycle_time = walk_cycle_time(velocity.linvel.x.abs());
+            match animation {
+                Some(mut animation) if animation.sprites == SPRITE_IDX_WALKING => {
+                    animation.set_cycle_time(cycle_time)
+                }
+                _ => {
+                    commands
+                        .entity(player_entity)
+                        .insert(Animation::new(SPRITE_IDX_WALKING, cycle_time));
+                }
+            }
+        } else {
             commands.entity(player_entity).remove::<Animation>();
-            sprite.index = SPRITE_IDX_STAND
+            sprite.index = SPRITE_IDX_STAND;
         }
     }
 }
 
-fn apply_fly_sprite(
+/// Airborne frames, driven by what the player is actually doing rather than by
+/// a free-running loop: a queen beats her wings once per flap and glides
+/// between beats, and a worker holds a rising frame until it starts to fall.
+fn animate_flight(
     mut commands: Commands,
-    mut query: Query<(Entity, &Player, Option<&Animation>)>,
+    time: Res<Time>,
+    mut query: Query<(
+        Entity,
+        &Player,
+        &Velocity,
+        &ActionState<Action>,
+        &mut TextureAtlas,
+        Option<&mut Wingbeat>,
+    )>,
 ) {
-    for (player_entity, player, animation) in query.iter_mut() {
-        if !player.is_on_ground
-            && animation.map_or(true, |animation| animation.sprites == SPRITE_IDX_WALKING)
-        {
-            commands
-                .entity(player_entity)
-                .insert(Animation::new(SPRITE_IDX_FLYING, CYCLE_DELAY));
+    for (player_entity, player, velocity, action_state, mut sprite, wingbeat) in query.iter_mut() {
+        // Ticked before the ground check so a beat interrupted by a landing
+        // still expires instead of being frozen mid-flap.
+        let (has_wings, wings_are_out) = match wingbeat {
+            Some(mut wingbeat) => {
+                wingbeat.timer.tick(time.delta());
+                (true, wingbeat.wings_are_out())
+            }
+            None => (false, false),
+        };
+        if player.is_on_ground || action_state.pressed(&Action::Dive) {
+            continue;
         }
+        commands.entity(player_entity).remove::<Animation>();
+        sprite.index = if wings_are_out || (!has_wings && velocity.linvel.y > 0.0) {
+            SPRITE_IDX_WINGS_OUT
+        } else {
+            SPRITE_IDX_GLIDE
+        };
     }
 }
 
@@ -811,6 +883,7 @@ fn spawn_players(
                     is_on_ground: false,
                 },
                 Name::new("Player"),
+                MotionTrail::default(),
                 InputManagerBundle::with_map(input_map),
                 ev.player_controller,
                 match ev.team {
@@ -838,6 +911,7 @@ fn spawn_players(
             ));
             if ev.is_queen {
                 player.insert(Wings);
+                player.insert(Wingbeat::default());
                 player.insert(Queen);
             }
             if ev.start_invincible {
@@ -889,5 +963,108 @@ fn reset_all_players(
             delay: 0.0,
             start_invincible: false,
         });
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A bare app rather than `MinimalPlugins`: `TimePlugin` would overwrite
+    /// `Time` from the real clock every frame and undo `advance_by`.
+    fn flight_app() -> App {
+        let mut app = App::new();
+        app.init_resource::<Time>()
+            .add_systems(Update, animate_flight);
+        app
+    }
+
+    fn spawn_flier(app: &mut App, has_wings: bool, vertical_speed: f32) -> Entity {
+        let mut flier = app.world.spawn((
+            Player {
+                player_controller: PlayerController::Keyboard(KeyboardSlot::Left),
+                is_on_ground: false,
+            },
+            Velocity::linear(Vec2::new(0.0, vertical_speed)),
+            ActionState::<Action>::default(),
+            TextureAtlas {
+                index: SPRITE_IDX_STAND,
+                ..Default::default()
+            },
+        ));
+        if has_wings {
+            flier.insert(Wingbeat::default());
+        }
+        flier.id()
+    }
+
+    fn advance(app: &mut App, delta: Duration) {
+        app.world.resource_mut::<Time>().advance_by(delta);
+        app.update();
+    }
+
+    fn sprite_index(app: &App, entity: Entity) -> usize {
+        app.world.get::<TextureAtlas>(entity).unwrap().index
+    }
+
+    #[test]
+    fn a_flap_shows_the_wings_then_tucks_them() {
+        let mut app = flight_app();
+        let queen = spawn_flier(&mut app, true, 0.0);
+        app.world.get_mut::<Wingbeat>(queen).unwrap().start();
+
+        advance(&mut app, FLAP_DURATION / 4);
+        assert_eq!(sprite_index(&app, queen), SPRITE_IDX_WINGS_OUT);
+
+        advance(&mut app, FLAP_DURATION / 2);
+        assert_eq!(sprite_index(&app, queen), SPRITE_IDX_GLIDE);
+    }
+
+    #[test]
+    fn a_queen_glides_when_she_is_not_flapping() {
+        let mut app = flight_app();
+        // Rising, but between beats: a queen's wings answer to her flaps, not
+        // to which way she happens to be moving.
+        let queen = spawn_flier(&mut app, true, PLAYER_MAX_RISE_SPEED);
+
+        advance(&mut app, FLAP_DURATION);
+
+        assert_eq!(sprite_index(&app, queen), SPRITE_IDX_GLIDE);
+    }
+
+    #[test]
+    fn a_worker_holds_a_rising_frame_until_it_falls() {
+        let mut app = flight_app();
+        let worker = spawn_flier(&mut app, false, PLAYER_JUMP_IMPULSE);
+
+        advance(&mut app, Duration::from_millis(16));
+        assert_eq!(sprite_index(&app, worker), SPRITE_IDX_WINGS_OUT);
+
+        *app.world.get_mut::<Velocity>(worker).unwrap() =
+            Velocity::linear(Vec2::new(0.0, -PLAYER_MAX_FALL_SPEED));
+        advance(&mut app, Duration::from_millis(16));
+        assert_eq!(sprite_index(&app, worker), SPRITE_IDX_GLIDE);
+    }
+
+    #[test]
+    fn a_grounded_player_is_left_to_the_ground_animation() {
+        let mut app = flight_app();
+        let queen = spawn_flier(&mut app, true, 0.0);
+        app.world.get_mut::<Player>(queen).unwrap().is_on_ground = true;
+        app.world.get_mut::<Wingbeat>(queen).unwrap().start();
+
+        advance(&mut app, FLAP_DURATION / 4);
+
+        assert_eq!(sprite_index(&app, queen), SPRITE_IDX_STAND);
+    }
+
+    #[test]
+    fn the_run_cycle_speeds_up_with_the_player() {
+        assert!(walk_cycle_time(PLAYER_MAX_VELOCITY_X) < walk_cycle_time(PLAYER_MIN_VELOCITY_X));
+        assert_eq!(walk_cycle_time(0.0), walk_cycle_time(PLAYER_MIN_VELOCITY_X));
+        assert_eq!(
+            walk_cycle_time(PLAYER_MAX_VELOCITY_X * 2.0),
+            walk_cycle_time(PLAYER_MAX_VELOCITY_X)
+        );
     }
 }
